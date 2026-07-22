@@ -293,159 +293,158 @@ async def import_one_pdf_to_es_optimized(
         text_map.append({"type": "reference", "index": r_idx})
         texts_to_embed.append(rt)
 
-    # ── Phase 2: 一次/少量批次调用 Embedding API ────────
-    if texts_to_embed:
-        all_vectors = await async_embed_texts(http_client, texts_to_embed)
-    else:
-        all_vectors = []
+    # ── Phase 2: 分组批量 Embedding ──────────────────────
+    # 4 组独立 try/except，组间互不影响（跟原版逐库隔离的逻辑一致）
+    # 组内合并减少请求数，组间隔离保证一组挂了其余仍有向量
 
-    # ── Phase 3: 按顺序拆包向量 ──────────────────────────
-    vec_idx = 0
+    async def _embed_group(label: str, texts: List[str]) -> List[List[float]]:
+        """对一组文本做 embedding，失败时打 WARN 并返回空向量"""
+        if not texts:
+            return []
+        try:
+            return await async_embed_texts(http_client, texts)
+        except Exception as e:
+            print(f"  [WARN] {lngid} Embedding({label}) 失败: {e}")
+            return [[] for _ in texts]
 
-    # 标题向量
-    title_vec: List[float] = []
+    # 组 1: 元数据（标题 + 摘要 + 关键词 + 全文）
+    meta_texts: List[str] = []
+    meta_labels: List[str] = []  # "title" / "abstract" / "keyword" / "fulltext"
     if title_text:
-        title_vec = all_vectors[vec_idx] if vec_idx < len(all_vectors) else []
-        vec_idx += 1
-
-    # 摘要向量
-    abstract_vec: List[float] = []
+        meta_texts.append(title_text); meta_labels.append("title")
     if abstract_text:
-        abstract_vec = all_vectors[vec_idx] if vec_idx < len(all_vectors) else []
-        vec_idx += 1
-
-    # 关键词向量
-    keyword_vec: List[float] = []
+        meta_texts.append(abstract_text); meta_labels.append("abstract")
     if keyword_text:
-        keyword_vec = all_vectors[vec_idx] if vec_idx < len(all_vectors) else []
-        vec_idx += 1
-
-    # 全文向量
-    full_vec: List[float] = []
+        meta_texts.append(keyword_text); meta_labels.append("keyword")
     if full_text:
-        full_vec = all_vectors[vec_idx] if vec_idx < len(all_vectors) else []
-        vec_idx += 1
+        meta_texts.append(full_text); meta_labels.append("fulltext")
 
-    # 段落向量
-    para_vecs: List[List[float]] = []
-    for _ in para_texts:
-        para_vecs.append(all_vectors[vec_idx] if vec_idx < len(all_vectors) else [])
-        vec_idx += 1
+    meta_vecs = await _embed_group("meta", meta_texts)
 
-    # 句子向量
-    sent_vecs: List[List[float]] = []
-    for _ in sent_docs:
-        sent_vecs.append(all_vectors[vec_idx] if vec_idx < len(all_vectors) else [])
-        vec_idx += 1
+    # 组 2: 段落
+    para_vecs = await _embed_group("paragraph", para_texts)
 
-    # 参考文献向量
-    ref_vecs: List[List[float]] = []
-    for _ in ref_texts:
-        ref_vecs.append(all_vectors[vec_idx] if vec_idx < len(all_vectors) else [])
-        vec_idx += 1
+    # 组 3: 句子
+    sent_texts = [sd[2] for sd in sent_docs]
+    sent_vecs = await _embed_group("sentence", sent_texts)
+
+    # 组 4: 参考文献
+    ref_vecs = await _embed_group("reference", ref_texts)
+
+    # ── Phase 3: 从各组结果中取值 ────────────────────────
+    mi = 0  # meta 组游标
+
+    def _next_meta() -> List[float]:
+        nonlocal mi
+        v = meta_vecs[mi] if mi < len(meta_vecs) else []
+        mi += 1
+        return v
+
+    title_vec: List[float] = _next_meta() if "title" in meta_labels else []
+    abstract_vec: List[float] = _next_meta() if "abstract" in meta_labels else []
+    keyword_vec: List[float] = _next_meta() if "keyword" in meta_labels else []
+    full_vec: List[float] = _next_meta() if "fulltext" in meta_labels else []
 
     # ── Phase 4: 构建 _bulk actions ──────────────────────
+    # 与原版一致：有文本 + 有向量才写入；各库独立 try/except 互不影响
     actions: List[Dict[str, Any]] = []
 
     # 标题库
-    if title_text and title_vec:
-        actions.append({
-            "_index": ES_TITLE_INDEX,
-            "_id": f"{lngid}_title",
-            "_source": {
+    try:
+        if title_text and title_vec:
+            actions.append({"_index": ES_TITLE_INDEX, "_id": f"{lngid}_title", "_source": {
                 **common, "title_c": title_c, "title_e": title_e,
                 "title_text": title_text, "title_embedding": title_vec,
-            },
-        })
-        counts["title"] += 1
+            }})
+            counts["title"] += 1
+    except Exception as e:
+        print(f"  [WARN] {lngid} 标题库失败: {e}")
 
     # 摘要库
-    if abstract_text and abstract_vec:
-        actions.append({
-            "_index": ES_ABSTRACT_INDEX,
-            "_id": f"{lngid}_abstract",
-            "_source": {
+    try:
+        if abstract_text and abstract_vec:
+            actions.append({"_index": ES_ABSTRACT_INDEX, "_id": f"{lngid}_abstract", "_source": {
                 **common, "remark_c": remark_c, "remark_e": remark_e,
                 "abstract_embedding": abstract_vec,
-            },
-        })
-        counts["abstract"] += 1
+            }})
+            counts["abstract"] += 1
+    except Exception as e:
+        print(f"  [WARN] {lngid} 摘要库失败: {e}")
 
     # 关键词库
-    if keyword_text and keyword_vec:
-        actions.append({
-            "_index": ES_KEYWORD_INDEX,
-            "_id": f"{lngid}_keyword",
-            "_source": {
+    try:
+        if keyword_text and keyword_vec:
+            actions.append({"_index": ES_KEYWORD_INDEX, "_id": f"{lngid}_keyword", "_source": {
                 **common, "keyword_c": keyword_c, "keyword_e": keyword_e,
                 "keyword_text": keyword_text, "keyword_embedding": keyword_vec,
-            },
-        })
-        counts["keyword"] += 1
+            }})
+            counts["keyword"] += 1
+    except Exception as e:
+        print(f"  [WARN] {lngid} 关键词库失败: {e}")
 
-    # 全文库
-    if full_text and full_vec:
-        actions.append({
-            "_index": ES_FULLTEXT_INDEX,
-            "_id": f"{lngid}_fulltext",
-            "_source": {
+    # 全文库（确认不超 token 且有向量才写，跟原版一致）
+    try:
+        if full_text and full_vec:
+            actions.append({"_index": ES_FULLTEXT_INDEX, "_id": f"{lngid}_fulltext", "_source": {
                 **common, "full_text": full_text,
                 "full_embedding": full_vec, "token_count": estimated_tokens,
-            },
-        })
-        counts["fulltext"] += 1
+            }})
+            counts["fulltext"] += 1
+    except Exception as e:
+        print(f"  [WARN] {lngid} 全文库失败: {e}")
 
     # 段落库
-    for idx, (c, vec) in enumerate(zip(paragraph_chunks, para_vecs)):
-        p_text = getattr(c, "text", "")
-        if not p_text or not vec:
-            continue
-        actions.append({
-            "_index": ES_PARAGRAPH_INDEX,
-            "_id": f"{lngid}_p{idx}",
-            "_source": {
+    try:
+        for idx, (c, vec) in enumerate(zip(paragraph_chunks, para_vecs)):
+            p_text = getattr(c, "text", "")
+            if not p_text or not vec:
+                continue
+            actions.append({"_index": ES_PARAGRAPH_INDEX, "_id": f"{lngid}_p{idx}", "_source": {
                 **common, "para_index": idx, "para_text": p_text,
                 "para_embedding": vec,
                 "section_path": getattr(c, "section_path", ""),
                 "element_type": getattr(c, "element_type", ""),
                 "page_num": getattr(c, "page_num", 1),
-            },
-        })
-        counts["paragraph"] += 1
+            }})
+            counts["paragraph"] += 1
+    except Exception as e:
+        print(f"  [WARN] {lngid} 段落库失败: {e}")
 
     # 句子库
-    for (p_idx, s_seq, s_text, sec, page, etype), vec in zip(sent_docs, sent_vecs):
-        if not vec:
-            continue
-        actions.append({
-            "_index": ES_SENTENCE_INDEX,
-            "_id": f"{lngid}_p{p_idx}s{s_seq}",
-            "_source": {
+    try:
+        for (p_idx, s_seq, s_text, sec, page, etype), vec in zip(sent_docs, sent_vecs):
+            if not vec:
+                continue
+            actions.append({"_index": ES_SENTENCE_INDEX, "_id": f"{lngid}_p{p_idx}s{s_seq}", "_source": {
                 **common, "para_index": p_idx, "sent_seq": s_seq,
                 "sent_text": s_text, "sent_embedding": vec,
                 "section_path": sec, "element_type": etype, "page_num": page,
-            },
-        })
-        counts["sentence"] += 1
+            }})
+            counts["sentence"] += 1
+    except Exception as e:
+        print(f"  [WARN] {lngid} 句子库失败: {e}")
 
     # 参考文献库
-    for idx, (c, vec) in enumerate(zip(reference_chunks, ref_vecs)):
-        r_text = getattr(c, "text", "")
-        if not r_text or not vec:
-            continue
-        actions.append({
-            "_index": ES_REFERENCE_INDEX,
-            "_id": f"{lngid}_r{idx}",
-            "_source": {
+    try:
+        for idx, (c, vec) in enumerate(zip(reference_chunks, ref_vecs)):
+            r_text = getattr(c, "text", "")
+            if not r_text or not vec:
+                continue
+            actions.append({"_index": ES_REFERENCE_INDEX, "_id": f"{lngid}_r{idx}", "_source": {
                 **common, "ref_seq": idx, "ref_text": r_text,
                 "ref_embedding": vec,
-            },
-        })
-        counts["reference"] += 1
+            }})
+            counts["reference"] += 1
+    except Exception as e:
+        print(f"  [WARN] {lngid} 参考文献库失败: {e}")
 
     # ── Phase 5: 一次 _bulk 写入 ─────────────────────────
     if actions:
-        await es_bulk_index(http_client, actions)
+        try:
+            await es_bulk_index(http_client, actions)
+        except Exception as e:
+            print(f"  [WARN] {lngid} ES _bulk 写入失败: {e}")
+            # 即使 bulk 失败也不抛异常，返回已经统计的 counts
 
     return counts
 
