@@ -55,14 +55,20 @@ MINERU_PORTS = [8060]
 _port_index = 0
 processed_lock = asyncio.Lock()
 
-# Embedding API 配置（来自 global_config_variable）
+# Embedding API 自适应参数
 EMBEDDING_API_URL = f"{embedding_base_url.rstrip('/')}/embeddings"
 EMBEDDING_MODEL = Embedding_model_name
 EMBEDDING_HEADERS = {
     "Authorization": f"Bearer {embedding_api_key}",
     "Content-Type": "application/json",
 }
-EMBEDDING_BATCH_SIZE = 64  # 每批发送给 Embedding API 的最大文本数
+EMBEDDING_BATCH_SIZE = 64  # 初始批大小，运行中自动调小
+_embedding_safe_batch = EMBEDDING_BATCH_SIZE  # 运行时动态学习到的安全 batch 大小
+_batch_lock = asyncio.Lock()
+
+# ES _bulk 自适应参数
+ES_BULK_MAX_COUNT = 500   # 单次 _bulk 最多包含的 action 数（超了自动拆）
+ES_BULK_MAX_MB = 8        # 单次 _bulk 最大载荷（估算 MB），超了自动拆
 
 
 def get_next_mineru_port() -> int:
@@ -73,20 +79,28 @@ def get_next_mineru_port() -> int:
 
 
 # =========================================================
-# 优化 1：异步批量 Embedding（一次收集，少量请求）
+# 优化 1：自适应异步批量 Embedding
 # =========================================================
 
 async def async_embed_texts(
     http_client: httpx.AsyncClient,
     texts: List[str],
-    batch_size: int = EMBEDDING_BATCH_SIZE,
+    batch_size: Optional[int] = None,
 ) -> List[List[float]]:
     """
-    使用 httpx.AsyncClient 异步调用 Embedding API，不再阻塞事件循环。
-    支持自动降级：如果 batch 太大导致 413，自动减半重试。
+    自适应 Embedding 调用：
+    - 初始用全局学习到的安全 batch_size，避免反复撞墙
+    - 遇到 413 (Payload Too Large) 自动减半重试，并更新全局安全值
+    - 遇到 5xx / 超时 自动减半重试
+    - 最终减到 1 还失败才抛异常
     """
+    global _embedding_safe_batch
+
     if not texts:
         return []
+
+    if batch_size is None:
+        batch_size = _embedding_safe_batch
 
     all_embeddings: List[List[float]] = []
 
@@ -96,17 +110,45 @@ async def async_embed_texts(
         total_batches = (len(texts) - 1) // batch_size + 1
 
         payload = {"input": batch_texts, "model": EMBEDDING_MODEL}
-        resp = await http_client.post(EMBEDDING_API_URL, json=payload, headers=EMBEDDING_HEADERS)
+        resp = await http_client.post(
+            EMBEDDING_API_URL, json=payload, headers=EMBEDDING_HEADERS,
+        )
 
-        if resp.status_code == 413:
-            # Payload Too Large → 减半重试
+        # ── 自适应降级 ──────────────────────────────────
+        if resp.status_code in (413, 502, 503, 504) or resp.status_code >= 500:
+            if batch_size <= 1:
+                raise RuntimeError(
+                    f"Embedding API 错误 batch_size=1 仍失败 "
+                    f"(HTTP {resp.status_code}): {resp.text[:500]}"
+                )
             smaller = max(batch_size // 2, 1)
-            print(f"  [Embedding] 批次 {batch_num} 过大 (413)，降级到 batch_size={smaller}")
-            sub_embeddings = await async_embed_texts(http_client, batch_texts, smaller)
+            print(
+                f"  [Embedding] 批次 {batch_num} HTTP {resp.status_code}，"
+                f"batch_size {batch_size} → {smaller}"
+            )
+            # 动态更新全局安全值（取最小值，越学越保守）
+            async with _batch_lock:
+                _embedding_safe_batch = min(_embedding_safe_batch, smaller)
+            # 递归：用减半后的 size 重试这批文本
+            sub_embeddings = await async_embed_texts(
+                http_client, batch_texts, smaller,
+            )
             all_embeddings.extend(sub_embeddings)
             continue
 
         if resp.status_code != 200:
+            # 非 413/5xx 错误（如 4xx 参数错误），尝试减半
+            if batch_size > 1:
+                smaller = max(batch_size // 2, 1)
+                print(
+                    f"  [Embedding] 批次 {batch_num} HTTP {resp.status_code}，"
+                    f"尝试降级 batch_size={smaller}"
+                )
+                sub_embeddings = await async_embed_texts(
+                    http_client, batch_texts, smaller,
+                )
+                all_embeddings.extend(sub_embeddings)
+                continue
             raise RuntimeError(
                 f"Embedding API 错误 (HTTP {resp.status_code}): {resp.text[:500]}"
             )
@@ -116,61 +158,196 @@ async def async_embed_texts(
         all_embeddings.extend(batch_embeddings)
 
         if total_batches > 1:
-            print(f"  [Embedding] 批次 {batch_num}/{total_batches} 完成 ({len(batch_texts)} 条)")
+            print(
+                f"  [Embedding] 批次 {batch_num}/{total_batches} 完成 "
+                f"({len(batch_texts)} 条)"
+            )
 
     return all_embeddings
 
 
 # =========================================================
-# 优化 2：ES _bulk 批量写入
+# 优化 2：自适应 ES _bulk 批量写入
 # =========================================================
 
 async def es_bulk_index(
     http_client: httpx.AsyncClient,
     actions: List[Dict[str, Any]],
+    max_count: int = ES_BULK_MAX_COUNT,
+    max_mb: int = ES_BULK_MAX_MB,
 ) -> Dict[str, Any]:
     """
-    将多个 index 操作打包为一次 _bulk 请求（NDJSON 格式）。
-    actions 每项格式: {"_index": "...", "_id": "...", "_source": {...}}
+    自适应 ES _bulk 写入：自动按数量和载荷大小拆分成多个子批次。
+
+    - actions 超过 max_count 条 → 拆
+    - 估算 NDJSON 大小超过 max_mb → 拆
+    - 单个子批次遇到 413 / timeout → 再拆更小重试
     """
+    if not actions:
+        return {"took": 0, "errors": False, "items": []}
+
+    # ── 第一阶段：按静态阈值预拆分 ──────────────────────
+    chunks = _split_actions_into_chunks(actions, max_count, max_mb)
+
+    merged_result: Dict[str, Any] = {"took": 0, "errors": False, "items": []}
+
+    for chunk_idx, chunk_actions in enumerate(chunks):
+        if len(chunks) > 1:
+            print(
+                f"  [ES Bulk] 子批次 {chunk_idx + 1}/{len(chunks)} "
+                f"({len(chunk_actions)} 条)"
+            )
+
+        chunk_result = await _es_bulk_send(
+            http_client, chunk_actions, max_mb,
+        )
+        merged_result["took"] += chunk_result.get("took", 0)
+        if chunk_result.get("errors"):
+            merged_result["errors"] = True
+        merged_result["items"].extend(chunk_result.get("items", []))
+
+    return merged_result
+
+
+def _estimate_bulk_mb(actions: List[Dict[str, Any]]) -> float:
+    """估算 NDJSON 载荷的 MB 数（不用真正序列化，省 CPU）"""
+    total_chars = 0
+    for a in actions:
+        # 操作行约 60~80 字符 + 数据行
+        meta_chars = 60 + len(a["_index"]) + len(a["_id"])
+        source = a.get("_source", {})
+        # embedding 是主要的体积来源（1024 维 float ≈ 8000 字符）
+        source_chars = 200  # 基础字段
+        for key in source:
+            if key.endswith("_embedding") and isinstance(source[key], list):
+                source_chars += len(source[key]) * 8  # 每个 float ≈ "0.1234567,"
+            elif isinstance(source[key], str):
+                source_chars += len(source[key])
+        total_chars += meta_chars + source_chars
+    return total_chars / (1024 * 1024)  # chars → MB
+
+
+def _split_actions_into_chunks(
+    actions: List[Dict[str, Any]],
+    max_count: int,
+    max_mb: float,
+) -> List[List[Dict[str, Any]]]:
+    """将 actions 列表按数量和估算大小拆分成多个 chunk"""
+    chunks: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    current_mb = 0.0
+
+    for a in actions:
+        single_mb = _estimate_bulk_mb([a])
+        # 当前 chunk 加上这条会超限 → 先封存当前 chunk
+        if current and (
+            len(current) >= max_count
+            or current_mb + single_mb > max_mb
+        ):
+            chunks.append(current)
+            current = []
+            current_mb = 0.0
+        current.append(a)
+        current_mb += single_mb
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+async def _es_bulk_send(
+    http_client: httpx.AsyncClient,
+    actions: List[Dict[str, Any]],
+    max_mb: float,
+    _depth: int = 0,
+) -> Dict[str, Any]:
+    """发送单次 _bulk 请求，遇 413 / timeout 自动拆小重试"""
     if not actions:
         return {"took": 0, "errors": False, "items": []}
 
     lines = []
     for action in actions:
-        # 第一行：操作元数据
         lines.append(json.dumps(
             {"index": {"_index": action["_index"], "_id": action["_id"]}},
             ensure_ascii=False,
         ))
-        # 第二行：文档数据
         lines.append(json.dumps(action["_source"], ensure_ascii=False))
-
-    body = "\n".join(lines) + "\n"  # 尾部空行不能少
+    body = "\n".join(lines) + "\n"
 
     url = f"{ES_URL.rstrip('/')}/_bulk"
-    resp = await http_client.post(
-        url,
-        content=body,
-        headers={"Content-Type": "application/x-ndjson"},
-    )
+    try:
+        resp = await http_client.post(
+            url,
+            content=body,
+            headers={"Content-Type": "application/x-ndjson"},
+        )
+    except Exception as e:
+        # 网络错误（超时等）→ 拆小重试
+        if len(actions) > 1 and _depth < 3:
+            smaller_mb = max(max_mb / 2, 0.5)
+            print(
+                f"  [ES Bulk] 请求失败 ({e})，"
+                f"拆成两半重试 (mb={smaller_mb:.1f})"
+            )
+            chunks = _split_actions_into_chunks(
+                actions, max(len(actions) // 2, 1), smaller_mb,
+            )
+            merged = {"took": 0, "errors": False, "items": []}
+            for chunk in chunks:
+                sub = await _es_bulk_send(
+                    http_client, chunk, smaller_mb, _depth + 1,
+                )
+                merged["took"] += sub.get("took", 0)
+                if sub.get("errors"):
+                    merged["errors"] = True
+                merged["items"].extend(sub.get("items", []))
+            return merged
+        raise
+
+    if resp.status_code == 413 and len(actions) > 1 and _depth < 3:
+        smaller_mb = max(max_mb / 2, 0.5)
+        print(
+            f"  [ES Bulk] HTTP 413 载荷过大，"
+            f"拆成两半重试 (mb={smaller_mb:.1f})"
+        )
+        chunks = _split_actions_into_chunks(
+            actions, max(len(actions) // 2, 1), smaller_mb,
+        )
+        merged = {"took": 0, "errors": False, "items": []}
+        for chunk in chunks:
+            sub = await _es_bulk_send(
+                http_client, chunk, smaller_mb, _depth + 1,
+            )
+            merged["took"] += sub.get("took", 0)
+            if sub.get("errors"):
+                merged["errors"] = True
+            merged["items"].extend(sub.get("items", []))
+        return merged
 
     if resp.status_code != 200:
-        print(f"  [ES Bulk Error] HTTP {resp.status_code}: {resp.text[:500]}")
+        print(
+            f"  [ES Bulk Error] HTTP {resp.status_code}: {resp.text[:500]}"
+        )
         return {"took": 0, "errors": True, "items": []}
 
     result = resp.json()
     if result.get("errors"):
-        # 打印具体失败条目
         failed_items = [
             item for item in result.get("items", [])
             if "error" in item.get("index", {})
         ]
-        for fi in failed_items[:5]:  # 最多打印前5条
+        for fi in failed_items[:5]:
             idx_info = fi.get("index", {})
-            print(f"  [ES Bulk Error] _id={idx_info.get('_id')}: {idx_info.get('error')}")
+            print(
+                f"  [ES Bulk Error] _id={idx_info.get('_id')}: "
+                f"{idx_info.get('error')}"
+            )
         if len(failed_items) > 5:
-            print(f"  [ES Bulk Error] ... 还有 {len(failed_items) - 5} 条失败")
+            print(
+                f"  [ES Bulk Error] ... 还有 "
+                f"{len(failed_items) - 5} 条失败"
+            )
 
     return result
 
