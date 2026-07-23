@@ -51,9 +51,53 @@ PROCESSED_FILE = Path("/tmp/500pdf_processed_ids_optimized.txt")
 STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 MAX_FULL_TOKENS = 8000
-MINERU_PORTS = [8060]
+MINERU_PORTS = [8060, 8061]                  # MinerU 实例端口列表
+MINERU_CONTAINER_NAMES = ["mineru", "mineru2"]  # 对应的 Docker 容器名
+MINERU_MAX_CONCURRENT = 2                    # 同时解析的并发数（有几个实例就设几个）
+MINERU_TASK_TIMEOUT = 600                    # 单篇 MinerU 解析总超时（秒），超时强制抛异常
+MAX_CONSECUTIVE_FAILS = 5                    # 连续 MinerU 失败 N 篇后自动重启容器
+CHUNK_SIZE = 500                             # 每批处理多少篇，批次间做健康检查+汇总
+
 _port_index = 0
+_consecutive_mineru_fails = 0
+_fail_lock = asyncio.Lock()
 processed_lock = asyncio.Lock()
+
+# ── MinerU 健康管理 ──────────────────────────────────
+
+async def restart_mineru_containers():
+    """重启所有 MinerU 容器，等待就绪"""
+    for name in MINERU_CONTAINER_NAMES:
+        print(f"  [RESTART] 正在重启容器 {name} ...")
+        proc = await asyncio.create_subprocess_exec("docker", "restart", name)
+        await proc.wait()
+        print(f"  [RESTART] 容器 {name} 已重启 (exit={proc.returncode})")
+    print(f"  [RESTART] 等待 30 秒让容器就绪...")
+    await asyncio.sleep(30)
+
+
+async def record_mineru_result(success: bool) -> bool:
+    """
+    记录一次 MinerU 调用结果。
+    成功 → 清零连续失败计数。
+    失败 → 连续失败+1，达到阈值返回 True（需要重启）。
+    """
+    global _consecutive_mineru_fails
+    async with _fail_lock:
+        if success:
+            _consecutive_mineru_fails = 0
+            return False
+        else:
+            _consecutive_mineru_fails += 1
+            print(
+                f"  [WARN] MinerU 连续失败 {_consecutive_mineru_fails}/"
+                f"{MAX_CONSECUTIVE_FAILS}"
+            )
+            if _consecutive_mineru_fails >= MAX_CONSECUTIVE_FAILS:
+                _consecutive_mineru_fails = 0
+                return True
+            return False
+
 
 # Embedding API 自适应参数
 EMBEDDING_API_URL = f"{embedding_base_url.rstrip('/')}/embeddings"
@@ -627,10 +671,11 @@ async def import_one_pdf_to_es_optimized(
 
 
 # =========================================================
-# 单篇处理（协程入口，逻辑与原版一致）
+# 单篇处理（协程入口）
 # =========================================================
 async def process_single_pdf(
     semaphore: asyncio.Semaphore,
+    mineru_semaphore: asyncio.Semaphore,
     pdf_path: Path,
     idx: int,
 ) -> Dict[str, Any]:
@@ -641,16 +686,26 @@ async def process_single_pdf(
             "success": False, "error": None, "counts": {}, "time": 0,
         }
         start = time.time()
+        mineru_ok = False  # 标记 MinerU 是否成功
         try:
-            # ── MinerU 解析（不变） ─────────────────────
+            # ── MinerU 解析（并发限制 + 总超时保护） ──────
             port = get_next_mineru_port()
-            parser = MinerUParserWithStructure(mineru_api_base=f"http://127.0.0.1:{port}")
-            raw_chunks, _ = await parser.parse_pdf_with_structure(str(pdf_path), pdf_path.name)
+            async with mineru_semaphore:
+                parser = MinerUParserWithStructure(
+                    mineru_api_base=f"http://127.0.0.1:{port}",
+                )
+                raw_chunks, _ = await asyncio.wait_for(
+                    parser.parse_pdf_with_structure(
+                        str(pdf_path), pdf_path.name,
+                    ),
+                    timeout=MINERU_TASK_TIMEOUT,
+                )
+            mineru_ok = True
 
-            # ── SQLite 元数据（不变） ────────────────────
+            # ── SQLite 元数据 ──────────────────────────────
             meta = load_metadata_by_lngid(lngid, db3_path=DB3_PATH)
 
-            # ── 共享 httpx.AsyncClient：Embedding + ES 共用，复用连接 ──
+            # ── Embedding + ES （共享 AsyncClient） ────────
             async with httpx.AsyncClient(trust_env=False, timeout=300.0) as http_client:
                 counts = await import_one_pdf_to_es_optimized(
                     http_client, lngid, raw_chunks, meta,
@@ -664,29 +719,52 @@ async def process_single_pdf(
                     f.flush()
             total = sum(counts.values())
             print(f"  [OK] [{idx:04d}] {pdf_path.name}: {total} 条 -> {counts}")
+
+        except asyncio.TimeoutError:
+            result["error"] = (
+                f"MinerU 解析超时 ({MINERU_TASK_TIMEOUT}s)，"
+                f"端口 {port}"
+            )
+            print(f"  [FAIL] [{idx:04d}] {pdf_path.name}: {result['error']}")
         except Exception as e:
             result["error"] = str(e)
             print(f"  [FAIL] [{idx:04d}] {pdf_path.name}: {e}")
+
         result["time"] = round(time.time() - start, 2)
+
+        # ── 连续失败检测 → 自动重启 ──────────────────────
+        restart_now = await record_mineru_result(mineru_ok)
+        if restart_now:
+            print(
+                f"  [AUTO-RESTART] 连续 {MAX_CONSECUTIVE_FAILS} 篇 MinerU 失败，"
+                f"重启所有容器..."
+            )
+            try:
+                await restart_mineru_containers()
+            except Exception as e:
+                print(f"  [WARN] 容器重启失败: {e}")
+
         return result
 
 
 # =========================================================
-# 批量导入主函数
+# 分块批量导入主函数
 # =========================================================
 async def run_batch_import(concurrent: int = 6, limit: int = 500):
     print("=" * 70)
-    print("[BATCH IMPORT - OPTIMIZED] 批量导入到7个索引")
-    print("  优化: 异步Embedding + 合并批处理 + ES _bulk 写入")
+    print("[BATCH IMPORT - OPTIMIZED] 分块批量导入到7个索引")
+    print("  优化: 超时保护 + 分块处理 + 连续失败自动重启 + Embedding合并 + ES_bulk")
     print("=" * 70)
     print(f"PDF目录: {PDF_DIR}")
     print(f"DB3: {DB3_PATH}")
     print(f"并发数: {concurrent}")
-    print(f"文件数: {limit}")
-    print(f"MinerU端口: {MINERU_PORTS}")
+    print(f"MinerU实例: {MINERU_PORTS}")
+    print(f"MinerU并发: {MINERU_MAX_CONCURRENT}")
+    print(f"单篇超时: {MINERU_TASK_TIMEOUT}s")
+    print(f"块大小: {CHUNK_SIZE} 篇")
+    print(f"连续失败阈值: {MAX_CONSECUTIVE_FAILS} 篇")
+    print(f"文件总数上限: {limit}")
     print(f"Embedding API: {EMBEDDING_API_URL}")
-    print(f"Embedding 模型: {EMBEDDING_MODEL}")
-    print(f"Embedding 批大小: {EMBEDDING_BATCH_SIZE}")
     print(f"状态文件: {PROCESSED_FILE}")
     print("=" * 70)
 
@@ -699,60 +777,101 @@ async def run_batch_import(concurrent: int = 6, limit: int = 500):
 
     all_pdf_files = sorted(PDF_DIR.glob("*.pdf"))[:limit]
     pending_pdfs = []
-    skipped_count = 0
     for p in all_pdf_files:
         lngid = extract_lngid_from_filename(p.name)
-        if lngid in processed_ids:
-            print(f"[SKIP] {p.name} 已处理，跳过")
-            skipped_count += 1
-        else:
+        if lngid not in processed_ids:
             pending_pdfs.append(p)
+
+    skipped = len(all_pdf_files) - len(pending_pdfs)
+    print(f"待处理: {len(pending_pdfs)} 篇（已跳过 {skipped} 篇）\n")
 
     if not pending_pdfs:
         print("所有 PDF 已处理完毕，无需操作。")
         return
 
-    print(f"待处理: {len(pending_pdfs)} 篇（已跳过 {skipped_count} 篇）\n")
-
+    # ── 分块处理 ────────────────────────────────────────
+    total_chunks = (len(pending_pdfs) - 1) // CHUNK_SIZE + 1
     semaphore = asyncio.Semaphore(concurrent)
-    start_time = time.time()
+    mineru_semaphore = asyncio.Semaphore(MINERU_MAX_CONCURRENT)
+    overall_start = time.time()
 
-    tasks = [process_single_pdf(semaphore, p, i) for i, p in enumerate(pending_pdfs, 1)]
-    results = await asyncio.gather(*tasks)
-
-    total_time = time.time() - start_time
-    success = [r for r in results if r["success"]]
-    fail = [r for r in results if not r["success"]]
-
+    all_success: List[Dict] = []
+    all_fail: List[Dict] = []
     total_counts = {
         "title": 0, "abstract": 0, "keyword": 0,
         "fulltext": 0, "paragraph": 0, "sentence": 0, "reference": 0,
     }
-    for r in success:
-        for k, v in r.get("counts", {}).items():
-            total_counts[k] = total_counts.get(k, 0) + v
+
+    for chunk_idx in range(total_chunks):
+        chunk_start = chunk_idx * CHUNK_SIZE
+        chunk_end = min(chunk_start + CHUNK_SIZE, len(pending_pdfs))
+        chunk_pdfs = pending_pdfs[chunk_start:chunk_end]
+
+        chunk_num = chunk_idx + 1
+        print(f"\n{'=' * 70}")
+        print(f"[CHUNK {chunk_num}/{total_chunks}] 处理 "
+              f"{chunk_start + 1} ~ {chunk_end} ({len(chunk_pdfs)} 篇)")
+        print(f"{'=' * 70}")
+
+        chunk_start_time = time.time()
+
+        # 创建任务：全局序号 = chunk 内偏移 + chunk 起始位置
+        tasks = [
+            process_single_pdf(semaphore, mineru_semaphore, p, chunk_start + i + 1)
+            for i, p in enumerate(chunk_pdfs)
+        ]
+        results = await asyncio.gather(*tasks)
+
+        chunk_time = time.time() - chunk_start_time
+
+        success = [r for r in results if r["success"]]
+        fail = [r for r in results if not r["success"]]
+        all_success.extend(success)
+        all_fail.extend(fail)
+
+        for r in success:
+            for k, v in r.get("counts", {}).items():
+                total_counts[k] = total_counts.get(k, 0) + v
+
+        elapsed = time.time() - overall_start
+        total_done = len(all_success) + len(all_fail)
+        print(
+            f"\n[CHUNK {chunk_num} 完成] "
+            f"成功 {len(success)} / 失败 {len(fail)} / "
+            f"耗时 {chunk_time:.1f}s / "
+            f"累计 {total_done}/{len(pending_pdfs)} / "
+            f"已运行 {elapsed/3600:.1f}h"
+        )
+
+    # ── 最终汇总 ────────────────────────────────────────
+    total_time = time.time() - overall_start
 
     print("\n" + "=" * 70)
     print("[SUMMARY] 汇总（优化版）")
     print("=" * 70)
-    print(f"成功: {len(success)} 篇 / 失败: {len(fail)} 篇")
+    print(f"成功: {len(all_success)} 篇 / 失败: {len(all_fail)} 篇")
     print(f"总耗时: {total_time:.1f}s ({total_time/3600:.2f}h)")
-    print(f"平均每篇: {total_time/len(pending_pdfs):.2f}s")
-    print(f"吞吐量: {len(success)/total_time*3600:.1f} 篇/小时")
+    if len(all_success) > 0:
+        print(f"平均每篇: {total_time/len(all_success):.2f}s")
+        print(f"吞吐量: {len(all_success)/total_time*3600:.1f} 篇/小时")
     print("\n各库写入量:")
     for k, v in total_counts.items():
         print(f"  {k:<12}: {v}")
 
     summary = {
-        "version": "optimized",
+        "version": "optimized_v2",
         "total_files": len(pending_pdfs),
-        "success": len(success),
-        "fail": len(fail),
+        "success": len(all_success),
+        "fail": len(all_fail),
         "total_time": total_time,
-        "throughput_per_hour": len(success) / total_time * 3600,
+        "throughput_per_hour": (
+            len(all_success) / total_time * 3600
+            if len(all_success) > 0 else 0
+        ),
         "counts": total_counts,
         "fail_details": [
-            {"filename": r["filename"], "error": r["error"]} for r in fail
+            {"filename": r["filename"], "error": r["error"]}
+            for r in all_fail
         ],
     }
     try:
