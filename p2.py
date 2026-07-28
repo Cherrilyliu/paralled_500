@@ -1,618 +1,392 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-百万 PDF 两阶段并行导入脚本。
+Mineru PDF 多进程并行处理脚本 (Mineru PDF Processing Parallel Pipeline)
+=====================================================================
 
-本文件保留 parallel_test_10000.py 的 Embedding、ES bulk 和索引构建逻辑，
-并借鉴 parallel_test_100.py 的 spawn 进程、任务/结果队列、哨兵、超时轮询、
-worker 存活检测和断点恢复机制。
+这是一个用于大规模 PDF 处理的工程化脚本。它基于 Python 的多进程 (Multiprocessing) 模块构建，
+能够自动将任务分发到多张 GPU 上并行运行。
 
-流水线：
-    PDF -> MinerU 解析进程（每端口可配置多个 worker）-> 磁盘临时文件
-        -> 主进程异步 Embedding/ES worker -> checkpoint
+主要功能：
+1. 多显卡并行：自动在指定的 GPU 之间进行负载均衡。
+2. 进程隔离：每个 Worker 进程独立运行，避免 CUDA 上下文冲突。
+3. 断点续传：支持跳过输出目录中已经存在的文件。
+4. 结构保持：输出文件会尝试保持输入文件夹的层级结构。
 
-解析结果不直接放入 multiprocessing.Queue，而是先写入 spool 目录，队列中只传
-文件路径，避免大批 raw_chunks 堵塞进程管道或撑爆内存。
+使用示例 (Usage Examples):
+------------------------
 
-每个 MinerU 端口的 worker 数可独立配置。例如，一个实例使用 4 个 worker：
-    python parallel_test_1000000.py \
-      --pdf-dir /data/pdfs --db3-path /data/meta.db3 \
-      --mineru-ports 8060 --workers-per-port 4 --index-workers 8
+1. 基本用法 (使用 0 号卡，启动 2 个进程):
+   python process_pdf.py --input-dir ./my_pdfs --output-dir ./output --gpus 0 --num-workers 2
 
-多个实例也可分别配置 worker 数，例如 8060 使用 2 个、8061 使用 3 个：
-    --mineru-ports 8060,8061 --workers-per-port 2,3
+2. 多卡并行 (使用 0,1,2,3 四张卡，每张卡跑 2 个进程，共 8 个进程):
+   python process_pdf.py --input-dir ./data --output-dir ./results --gpus 0,1,2,3 --num-workers 8
 
-默认每端口 1 个 worker，以便先建立稳定基线；应通过吞吐、显存和失败率压测逐步调高。
+3. 指定后端与语言 (使用 VLM 后端处理中文):
+   python process_pdf.py --input-dir ./pdfs --output-dir ./json --backend vlm-siliconcloud --lang zh
+
+4. 跳过已处理文件 (用于中断后恢复):
+   python process_pdf.py --input-dir ./data --output-dir ./results --skip-processed
+
+依赖安装:
+   pip install loguru mineru
+
+Author: relic-yuexi
+License: Apache-2.0
 """
-
-from __future__ import annotations
 
 import argparse
-import asyncio
 import json
+import logging
 import multiprocessing as mp
 import os
-import pickle
-import queue
-import shutil
-import signal
 import sys
-import threading
 import time
+import warnings
+import queue
 import traceback
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import List, Tuple, Optional, Set
 
+from loguru import logger
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parents[1]
-# 支持从任意工作目录直接运行本文件；同时兼容旧脚本中的 RAG 顶层导入。
-for import_root in (PROJECT_ROOT, PROJECT_ROOT / "algorithm"):
-    import_root_text = str(import_root)
-    if import_root_text not in sys.path:
-        sys.path.insert(0, import_root_text)
+# --- 配置与常量 ---
 
-DEFAULT_PDF_DIR = PROJECT_ROOT / "data" / "500pdf"
-DEFAULT_DB3_PATH = Path(
-    os.environ.get(
-        "DB3_PATH",
-        "/home/vscodeuser/yanjiushequ/Encyclopedia_project/zkyrjyjs_50w_20260707.db3",
-    )
-)
-DEFAULT_STATE_DIR = PROJECT_ROOT / "data" / "million_pdf_vec_result"
-COUNT_KEYS = (
-    "title", "abstract", "keyword", "fulltext",
-    "paragraph", "sentence", "reference",
+# Loguru 日志格式配置
+LOG_FORMAT = (
+    "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+    "<level>{level: <8}</level> | "
+    "<cyan>{extra[worker_id]}</cyan> | "
+    "<level>{message}</level>"
 )
 
-
-def extract_lngid(filename: str) -> str:
-    """在启动重依赖前提取 ID，规则与 metadata_loader 保持一致。"""
-    import re
-
-    base = os.path.basename(str(filename))
-    base = re.sub(r"\.(pdf|docx?|txt|md)$", "", base, flags=re.IGNORECASE)
-    base = re.sub(r"^vec_[a-f0-9]+_", "", base)
-    base = re.sub(r"^temp_[a-f0-9_-]+_", "", base)
-    return base.strip()
+# 抑制第三方库的冗余警告
+warnings.filterwarnings("ignore", message=".*Cannot set gray non-stroke color.*")
+warnings.filterwarnings("ignore", message=".*FontBBox.*")
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
+logging.getLogger("pypdfium2").setLevel(logging.ERROR)
 
 
-def load_processed_ids(checkpoint_file: Path) -> Set[str]:
-    if not checkpoint_file.exists():
-        return set()
-    with checkpoint_file.open("r", encoding="utf-8") as handle:
-        return {line.strip() for line in handle if line.strip()}
+def setup_worker_env(gpu_id: int, vram_size: int) -> None:
+    """
+    设置 Worker 进程的环境变量。
+    
+    关键说明:
+    必须在导入任何 torch 或 mineru 相关库之前调用此函数。
+    这通过设置 CUDA_VISIBLE_DEVICES 确保该进程只能看到被分配的那张显卡。
+    """
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    os.environ['MINERU_MODEL_SOURCE'] = "modelscope"
+    # 注意: 因为 CUDA_VISIBLE_DEVICES 已经屏蔽了其他卡，所以对进程来说永远是 device 0
+    os.environ['MINERU_DEVICE_MODE'] = "cuda:0"  
+    os.environ['MINERU_VIRTUAL_VRAM_SIZE'] = str(vram_size)
 
 
-def iter_pending_pdfs(
-    pdf_dir: Path,
-    processed_ids: Set[str],
-    limit: int,
-) -> Iterable[Tuple[int, Path, str]]:
-    """流式扫描，避免为一百万个 Path 再创建排序列表。"""
-    submitted = 0
-    for pdf_path in pdf_dir.rglob("*.pdf"):
-        lngid = extract_lngid(pdf_path.name)
-        if not lngid or lngid in processed_ids:
-            continue
-        submitted += 1
-        yield submitted, pdf_path, lngid
-        if limit > 0 and submitted >= limit:
-            return
+def process_single_pdf(
+    pdf_path: str,
+    output_base_dir: str,
+    lang: str,
+    backend: str,
+    gpu_id: int
+) -> Tuple[str, bool, Optional[str]]:
+    """
+    处理单个 PDF 的核心逻辑。
+    
+    Args:
+        pdf_path: PDF 文件绝对路径
+        output_base_dir: 输出根目录
+        lang: 语言代码 (如 'en', 'zh')
+        backend: 解析后端 ('pipeline', 'vlm-xxx')
+        gpu_id: 分配的物理 GPU ID (仅用于日志记录)
+        
+    Returns:
+        (file_path, is_success, error_message)
+    """
+    try:
+        # --- 关键：延迟导入 (Lazy Import) ---
+        # 必须在子进程内部导入这些库，防止在主进程中过早初始化 CUDA 上下文导致冲突。
+        from mineru.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2, prepare_env, read_fn
+        from mineru.data.data_reader_writer import FileBasedDataWriter
+        from mineru.utils.draw_bbox import draw_layout_bbox, draw_span_bbox
+        from mineru.utils.enum_class import MakeMode
+        from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
+        from mineru.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
+        from mineru.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make
+        from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
+        from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union_make
+        import copy
+
+        pdf_path_obj = Path(pdf_path)
+        
+        # --- 计算输出路径 ---
+        # 尝试保持相对目录结构。如果没有明确的层级，则保存到输出根目录。
+        try:
+            # 这里的逻辑是：如果 PDF 在 input_dir/A/B.pdf，我们希望输出到 output_dir/A/
+            # 简单起见，这里取父文件夹名作为子目录
+            rel_path = pdf_path_obj.parent.name 
+        except Exception:
+            rel_path = "."
+
+        target_output_dir = Path(output_base_dir) / rel_path
+        target_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        file_name = pdf_path_obj.stem
+        
+        # --- Mineru 处理逻辑 ---
+        pdf_bytes = read_fn(str(pdf_path_obj))
+        
+        # 设置解析参数
+        parse_method = "auto" if backend == "pipeline" else "vlm"
+        formula_enable = True
+        table_enable = True
+        
+        # 准备环境 (创建 output/images 和 output/md 目录)
+        local_image_dir, local_md_dir = prepare_env(str(target_output_dir), file_name, parse_method)
+        image_writer = FileBasedDataWriter(local_image_dir)
+        md_writer = FileBasedDataWriter(local_md_dir)
+        
+        # 根据后端选择处理流程
+        if backend == "pipeline":
+            infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list = pipeline_doc_analyze(
+                [pdf_bytes], [lang], 
+                parse_method="auto", 
+                formula_enable=formula_enable,
+                table_enable=table_enable
+            )
+            
+            # 提取 Pipeline 结果
+            model_list = infer_results[0]
+            images_list = all_image_lists[0]
+            pdf_doc = all_pdf_docs[0]
+            middle_json = pipeline_result_to_middle_json(
+                model_list, images_list, pdf_doc, image_writer, lang_list[0], ocr_enabled_list[0], formula_enable
+            )
+            make_func = pipeline_union_make
+            # model_output = copy.deepcopy(model_list) # 如果需要保存原始模型输出可解开注释
+            
+        else: # VLM 后端逻辑
+            vlm_backend_name = backend.replace("vlm-", "") if backend.startswith("vlm-") else backend
+            middle_json, model_output = vlm_doc_analyze(
+                pdf_bytes, image_writer=image_writer, backend=vlm_backend_name, server_url=None
+            )
+            make_func = vlm_union_make
+
+        # --- 生成最终结果文件 ---
+        pdf_info = middle_json["pdf_info"]
+        image_dir_name = os.path.basename(local_image_dir)
+        
+        # 1. 写入 Markdown
+        md_content = make_func(pdf_info, MakeMode.MM_MD, image_dir_name)
+        md_writer.write_string(f"{file_name}.md", md_content)
+        
+        # 2. 写入 Content List (JSON)
+        content_list = make_func(pdf_info, MakeMode.CONTENT_LIST, image_dir_name)
+        md_writer.write_string(f"{file_name}_content_list.json", json.dumps(content_list, ensure_ascii=False, indent=4))
+        
+        # 3. 写入 Middle JSON (包含详细结构信息，方便调试)
+        md_writer.write_string(f"{file_name}_middle.json", json.dumps(middle_json, ensure_ascii=False, indent=4))
+
+        logger.info(f"Success: {local_md_dir}")
+        return str(pdf_path), True, None
+
+    except Exception:
+        # 捕获所有异常，确保进程不崩溃
+        err_msg = traceback.format_exc()
+        # 只记录最后一行错误信息以保持日志整洁，详细堆栈已在 err_msg 中
+        logger.error(f"Error processing {pdf_path}: {err_msg.splitlines()[-1]}")
+        return str(pdf_path), False, err_msg
 
 
-def atomic_pickle_dump(value: Any, destination: Path) -> None:
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    with temporary.open("wb") as handle:
-        pickle.dump(value, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        handle.flush()
-        os.fsync(handle.fileno())
-    temporary.replace(destination)
-
-
-def parser_worker(
+def worker_loop(
     task_queue: mp.Queue,
     result_queue: mp.Queue,
-    worker_id: int,
-    mineru_port: int,
-    spool_dir: str,
-    task_timeout: int,
-    parse_retries: int,
-) -> None:
-    """一个解析进程绑定一个 MinerU 端口；多个进程可共享同一端口。"""
-    # 与 parallel_test_100.py 一样延迟导入，避免 spawn 前初始化重依赖。
-    import asyncio as worker_asyncio
-    from algorithm.knowledge_base.file_parser.service import MinerUParserWithStructure
+    gpu_id: int,
+    worker_idx: int,
+    vram_size: int
+):
+    """
+    Worker 进程的主循环。
+    不断从 task_queue 取任务，处理完后将结果放入 result_queue。
+    """
+    # 1. 初始化环境变量 (最重要的一步)
+    setup_worker_env(gpu_id, vram_size)
+    
+    # 2. 配置当前进程的 Logger (带上 Worker ID 和 GPU ID)
+    logger.configure(extra={"worker_id": f"W-{worker_idx}|GPU-{gpu_id}"})
+    logger.remove()
+    logger.add(sys.stderr, format=LOG_FORMAT, level="INFO")
+    
+    logger.info("Worker started.")
+    
+    while True:
+        try:
+            # 获取任务，设置超时防止死锁
+            task = task_queue.get(timeout=3.0)
+            
+            # 如果收到 None，说明是终止信号
+            if task is None:
+                break 
+                
+            # 解包任务参数
+            pdf_path, output_dir, lang, backend = task
+            
+            # 执行处理
+            result = process_single_pdf(pdf_path, output_dir, lang, backend, gpu_id)
+            
+            # 返回结果
+            result_queue.put(result)
+            
+        except queue.Empty:
+            continue
+        except Exception as e:
+            logger.critical(f"Worker crashed unexpectedly: {e}")
+            break
+            
+    logger.info("Worker shutdown.")
 
-    spool_root = Path(spool_dir)
-    parser = MinerUParserWithStructure(
-        mineru_api_base=f"http://127.0.0.1:{mineru_port}",
-    )
 
+def get_processed_files(output_dir: Path) -> Set[str]:
+    """扫描输出目录，获取已经处理完成的 PDF 文件名集合 (基于 .md 文件存在与否)"""
+    processed = set()
+    if output_dir.exists():
+        for f in output_dir.rglob("*.md"):
+            processed.add(f.stem)
+    return processed
+
+
+def main():
+    # --- 命令行参数定义 ---
+    parser = argparse.ArgumentParser(description="Mineru 多进程 PDF 并行解析工具")
+    parser.add_argument("--input-dir", type=str, required=True, help="输入 PDF 文件夹路径")
+    parser.add_argument("--output-dir", type=str, required=True, help="结果输出文件夹路径")
+    parser.add_argument("--num-workers", type=int, default=4, help="并行的 Worker 进程总数 (建议每张卡 2-4 个)")
+    parser.add_argument("--gpus", type=str, default="0", help="使用的 GPU ID 列表，用逗号分隔 (例如: '0,1,2')")
+    parser.add_argument("--backend", type=str, default="pipeline", choices=["pipeline", "vlm-siliconcloud", "vlm-openai"], help="解析后端选择")
+    parser.add_argument("--lang", type=str, default="en", help="文档主要语言 (en 或 zh)")
+    parser.add_argument("--skip-processed", action="store_true", help="是否跳过输出目录中已存在的文件")
+    parser.add_argument("--vram", type=int, default=8, help="每个进程预设的虚拟显存大小 (GB)，仅用于 MinerU 内部配置")
+    
+    args = parser.parse_args()
+    
+    # --- 初始化检查 ---
+    input_path = Path(args.input_dir)
+    output_path = Path(args.output_dir)
+    gpu_list = [int(x.strip()) for x in args.gpus.split(",")]
+    
+    if not input_path.exists():
+        logger.error(f"输入目录不存在: {input_path}")
+        sys.exit(1)
+
+    # --- 文件扫描 ---
+    logger.info(f"正在扫描目录: {input_path} ...")
+    all_pdfs = list(input_path.rglob("*.pdf"))
+    
+    # 过滤已处理文件
+    if args.skip_processed:
+        processed_files = get_processed_files(output_path)
+        pending_pdfs = [p for p in all_pdfs if p.stem not in processed_files]
+        logger.info(f"总文件数: {len(all_pdfs)} | 跳过已处理: {len(processed_files)} | 待处理: {len(pending_pdfs)}")
+    else:
+        pending_pdfs = all_pdfs
+        logger.info(f"待处理文件总数: {len(all_pdfs)}")
+
+    if not pending_pdfs:
+        logger.info("没有需要处理的文件。退出。")
+        return
+
+    # --- 多进程启动准备 ---
+    # 必须使用 'spawn' 模式，否则 CUDA 上下文会在 fork 时被错误复制
+    ctx = mp.get_context('spawn') 
+    task_queue = ctx.Queue()
+    result_queue = ctx.Queue()
+    
+    # 1. 填充任务队列
+    for pdf in pending_pdfs:
+        task_queue.put((str(pdf), str(output_path), args.lang, args.backend))
+    
+    # 2. 填充终止信号 (每个 Worker 需要一个 None)
+    for _ in range(args.num_workers):
+        task_queue.put(None)
+        
+    # 3. 启动 Worker 进程
+    processes = []
+    logger.info(f"启动 {args.num_workers} 个 Worker 进程，分布在 GPU: {gpu_list}")
+    
+    for i in range(args.num_workers):
+        # --- 核心数学逻辑：轮询分配 (Round-Robin) ---
+        # 公式: assigned_gpu = gpu_list[i % len(gpu_list)]
+        # 作用: 无论有多少个进程，都会均匀地依次分配给列表中的 GPU。
+        assigned_gpu = gpu_list[i % len(gpu_list)]
+        
+        p = ctx.Process(
+            target=worker_loop,
+            args=(task_queue, result_queue, assigned_gpu, i, args.vram)
+        )
+        p.start()
+        processes.append(p)
+
+    # --- 结果收集与监控 ---
+    success_count = 0
+    fail_count = 0
+    failed_files = []
+    
+    start_time = time.time()
+    total_tasks = len(pending_pdfs)
+    
     try:
-        while True:
+        while success_count + fail_count < total_tasks:
+            # 检查是否有僵尸进程 (所有 Worker 都挂了但任务没完)
+            if not any(p.is_alive() for p in processes) and result_queue.empty():
+                logger.error("所有 Worker 进程均已退出，但任务未完成。强制停止。")
+                break
+                
             try:
-                task = task_queue.get(timeout=3.0)
+                # 获取结果，超时时间 5 秒
+                path, success, msg = result_queue.get(timeout=5)
+                if success:
+                    success_count += 1
+                else:
+                    fail_count += 1
+                    failed_files.append((path, msg))
+                
+                # 每处理 10 个文件或遇到错误时打印进度
+                if (success_count + fail_count) % 10 == 0 or not success:
+                    logger.info(f"进度: {success_count + fail_count}/{total_tasks} | 成功: {success_count} | 失败: {fail_count}")
+                    
             except queue.Empty:
                 continue
-
-            if task is None:
-                break
-
-            task_id, pdf_path, lngid = task
-            result_queue.put({
-                "kind": "started",
-                "worker_id": worker_id,
-                "task_id": task_id,
-                "pdf_path": pdf_path,
-                "lngid": lngid,
-            })
-            started = time.time()
-            last_error: Optional[str] = None
-
-            for attempt in range(parse_retries + 1):
-                try:
-                    async def parse() -> Any:
-                        return await worker_asyncio.wait_for(
-                            parser.parse_pdf_with_structure(
-                                pdf_path, Path(pdf_path).name,
-                            ),
-                            timeout=task_timeout,
-                        )
-
-                    raw_chunks, _ = worker_asyncio.run(parse())
-                    spool_path = spool_root / f"{task_id:09d}_{lngid}.pickle"
-                    atomic_pickle_dump(raw_chunks, spool_path)
-                    result_queue.put({
-                        "kind": "parsed",
-                        "worker_id": worker_id,
-                        "task_id": task_id,
-                        "pdf_path": pdf_path,
-                        "lngid": lngid,
-                        "spool_path": str(spool_path),
-                        "parse_seconds": round(time.time() - started, 2),
-                    })
-                    last_error = None
-                    break
-                except Exception:
-                    last_error = traceback.format_exc()
-                    if attempt < parse_retries:
-                        time.sleep(min(2 ** attempt, 10))
-
-            if last_error is not None:
-                result_queue.put({
-                    "kind": "parse_failed",
-                    "worker_id": worker_id,
-                    "task_id": task_id,
-                    "pdf_path": pdf_path,
-                    "lngid": lngid,
-                    "error": last_error,
-                })
-    except BaseException:
-        result_queue.put({
-            "kind": "worker_crashed",
-            "worker_id": worker_id,
-            "error": traceback.format_exc(),
-        })
+                
+    except KeyboardInterrupt:
+        logger.warning("用户中断 (Ctrl+C)。正在终止所有进程...")
+        for p in processes:
+            p.terminate()
+            
     finally:
-        result_queue.put({"kind": "worker_done", "worker_id": worker_id})
-
-
-def put_task_until_stopped(
-    task_queue: mp.Queue,
-    task: Any,
-    stop_event: threading.Event,
-) -> bool:
-    """有界队列写入；周期醒来检查停止标志，避免 feeder 永久卡住。"""
-    while not stop_event.is_set():
-        try:
-            task_queue.put(task, timeout=1.0)
-            return True
-        except queue.Full:
-            continue
-    return False
-
-
-class PipelineState:
-    def __init__(self) -> None:
-        self.submitted = 0
-        self.parsed = 0
-        self.success = 0
-        self.failed = 0
-        self.counts = {key: 0 for key in COUNT_KEYS}
-        self.failures: List[Dict[str, Any]] = []
-        self.inflight: Dict[int, Dict[str, Any]] = {}
-        self.lock = asyncio.Lock()
-
-    async def record_failure(self, event: Dict[str, Any], stage: str) -> None:
-        async with self.lock:
-            self.failed += 1
-            self.failures.append({
-                "task_id": event.get("task_id"),
-                "filename": Path(event.get("pdf_path", "unknown")).name,
-                "lngid": event.get("lngid"),
-                "stage": stage,
-                "error": event.get("error", "unknown error"),
-            })
-            task_id = event.get("task_id")
-            if task_id is not None:
-                self.inflight.pop(task_id, None)
-
-
-async def feed_tasks(
-    task_queue: mp.Queue,
-    pdf_dir: Path,
-    processed_ids: Set[str],
-    limit: int,
-    parser_workers: int,
-    state: PipelineState,
-    stop_event: threading.Event,
-) -> None:
-    try:
-        for task_id, pdf_path, lngid in iter_pending_pdfs(
-            pdf_dir, processed_ids, limit,
-        ):
-            task = (task_id, str(pdf_path), lngid)
-            accepted = await asyncio.to_thread(
-                put_task_until_stopped, task_queue, task, stop_event,
-            )
-            if not accepted:
-                return
-            state.submitted += 1
-            if state.submitted % 1000 == 0:
-                print(f"[FEED] 已提交 {state.submitted} 篇")
-    finally:
-        if not stop_event.is_set():
-            for _ in range(parser_workers):
-                await asyncio.to_thread(
-                    put_task_until_stopped, task_queue, None, stop_event,
-                )
-
-
-def queue_get_with_timeout(result_queue: mp.Queue) -> Optional[Dict[str, Any]]:
-    try:
-        return result_queue.get(timeout=3.0)
-    except queue.Empty:
-        return None
-
-
-async def dispatch_parser_results(
-    result_queue: mp.Queue,
-    parsed_queue: asyncio.Queue,
-    processes: List[mp.Process],
-    index_workers: int,
-    state: PipelineState,
-    stop_event: threading.Event,
-) -> None:
-    done_workers: Set[int] = set()
-    expected_workers = len(processes)
-
-    while len(done_workers) < expected_workers:
-        event = await asyncio.to_thread(queue_get_with_timeout, result_queue)
-        if event is None:
-            if not any(process.is_alive() for process in processes):
-                print("[ERROR] 所有解析 worker 已退出，停止等待结果。")
-                stop_event.set()
-                break
-            continue
-
-        kind = event.get("kind")
-        if kind == "started":
-            state.inflight[event["task_id"]] = event
-        elif kind == "parsed":
-            state.parsed += 1
-            # 已经安全写入 spool，不再属于 parser worker 的在途任务；
-            # 后续由 index worker 接管，失败时仍不会写入 checkpoint。
-            state.inflight.pop(event["task_id"], None)
-            await parsed_queue.put(event)
-        elif kind == "parse_failed":
-            await state.record_failure(event, "mineru")
-            print(
-                f"[PARSE FAIL] #{event['task_id']} "
-                f"{Path(event['pdf_path']).name}"
-            )
-        elif kind == "worker_crashed":
-            print(
-                f"[WORKER CRASH] worker={event.get('worker_id')}: "
-                f"{event.get('error', '').splitlines()[-1:]}"
-            )
-        elif kind == "worker_done":
-            done_workers.add(event["worker_id"])
-
-    # worker 异常退出时，其正在处理但没有结果的任务不写 checkpoint；下次运行会补偿。
-    for event in list(state.inflight.values()):
-        await state.record_failure(
-            {**event, "error": "parser worker exited before returning a result"},
-            "worker_exit",
-        )
-
-    for _ in range(index_workers):
-        await parsed_queue.put(None)
-
-
-async def index_worker(
-    worker_id: int,
-    parsed_queue: asyncio.Queue,
-    http_client: Any,
-    legacy: Any,
-    db3_path: str,
-    checkpoint_file: Path,
-    failure_file: Path,
-    checkpoint_lock: asyncio.Lock,
-    index_semaphore: asyncio.Semaphore,
-    state: PipelineState,
-) -> None:
-    while True:
-        event = await parsed_queue.get()
-        if event is None:
-            parsed_queue.task_done()
-            return
-
-        spool_path = Path(event["spool_path"])
-        started = time.time()
-        try:
-            raw_chunks = await asyncio.to_thread(_load_pickle, spool_path)
-            meta = await asyncio.to_thread(
-                legacy.load_metadata_by_lngid,
-                event["lngid"],
-                db3_path=db3_path,
-            )
-            async with index_semaphore:
-                counts = await legacy.import_one_pdf_to_es_optimized(
-                    http_client, event["lngid"], raw_chunks, meta,
-                )
-
-            # checkpoint 只能在索引阶段完整返回后写入，并由主进程单写者锁保护。
-            async with checkpoint_lock:
-                with checkpoint_file.open("a", encoding="utf-8") as handle:
-                    handle.write(f"{event['lngid']}\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-
-            async with state.lock:
-                state.success += 1
-                state.inflight.pop(event["task_id"], None)
-                for key, value in counts.items():
-                    state.counts[key] = state.counts.get(key, 0) + value
-                done = state.success + state.failed
-
-            if done % 100 == 0 or state.success <= 10:
-                print(
-                    f"[OK] index-worker={worker_id} #{event['task_id']} "
-                    f"{Path(event['pdf_path']).name} "
-                    f"parse={event['parse_seconds']}s "
-                    f"index={time.time() - started:.1f}s "
-                    f"done={done}/{state.submitted}"
-                )
-        except Exception:
-            failed_event = {**event, "error": traceback.format_exc()}
-            await state.record_failure(failed_event, "embedding_or_es")
-            async with checkpoint_lock:
-                with failure_file.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps({
-                        "task_id": event["task_id"],
-                        "pdf_path": event["pdf_path"],
-                        "lngid": event["lngid"],
-                        "stage": "embedding_or_es",
-                        "error": failed_event["error"],
-                    }, ensure_ascii=False) + "\n")
-                    handle.flush()
-            print(f"[INDEX FAIL] #{event['task_id']} {event['pdf_path']}")
-        finally:
-            try:
-                spool_path.unlink(missing_ok=True)
-            except OSError as exc:
-                print(f"[WARN] 无法删除临时文件 {spool_path}: {exc}")
-            parsed_queue.task_done()
-
-
-def _load_pickle(path: Path) -> Any:
-    with path.open("rb") as handle:
-        return pickle.load(handle)
-
-
-async def run_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
-    pdf_dir = Path(args.pdf_dir).resolve()
-    state_dir = Path(args.state_dir).resolve()
-    checkpoint_file = state_dir / "processed_ids.txt"
-    failure_file = state_dir / "failures.jsonl"
-    stats_file = state_dir / "stats.json"
-    spool_dir = state_dir / "spool"
-
-    if not pdf_dir.is_dir():
-        raise FileNotFoundError(f"PDF 目录不存在: {pdf_dir}")
-
-    state_dir.mkdir(parents=True, exist_ok=True)
-    spool_dir.mkdir(parents=True, exist_ok=True)
-    # 上次被强制中断留下的 spool 不代表成功，删除后由 checkpoint 机制重新解析。
-    for stale_file in spool_dir.glob("*.pickle*"):
-        stale_file.unlink(missing_ok=True)
-
-    ports = [int(value.strip()) for value in args.mineru_ports.split(",") if value.strip()]
-    if not ports:
-        raise ValueError("至少需要一个 MinerU 端口")
-
-    worker_counts = [
-        int(value.strip())
-        for value in args.workers_per_port.split(",")
-        if value.strip()
-    ]
-    if len(worker_counts) == 1:
-        worker_counts *= len(ports)
-    elif len(worker_counts) != len(ports):
-        raise ValueError(
-            "workers-per-port 必须是一个整数，或与 mineru-ports 数量相同的列表"
-        )
-    if any(count < 1 for count in worker_counts):
-        raise ValueError("每个端口的 worker 数必须 >= 1")
-
-    worker_ports = [
-        port
-        for port, worker_count in zip(ports, worker_counts)
-        for _ in range(worker_count)
-    ]
-    parser_workers = len(worker_ports)
-
-    processed_ids = load_processed_ids(checkpoint_file)
-    print("=" * 72)
-    print("[MILLION PDF PIPELINE]")
-    print(f"PDF目录: {pdf_dir}")
-    print(f"已完成: {len(processed_ids)}")
-    print(f"任务上限: {args.limit}")
-    port_worker_config = ", ".join(
-        f"{port}={count}" for port, count in zip(ports, worker_counts)
-    )
-    print(f"MinerU端口/worker: {port_worker_config}")
-    print(f"解析进程总数: {parser_workers}")
-    print(f"索引协程: {args.index_workers}")
-    print(f"进程队列上限: {args.task_queue_size}")
-    print(f"解析结果队列上限: {args.parsed_queue_size}")
-    print(f"状态目录: {state_dir}")
-    print("=" * 72)
-
-    ctx = mp.get_context("spawn")
-    task_queue = ctx.Queue(maxsize=args.task_queue_size)
-    result_queue = ctx.Queue(maxsize=max(args.parsed_queue_size * 2, 8))
-    processes: List[mp.Process] = []
-
-    for worker_id, port in enumerate(worker_ports):
-        process = ctx.Process(
-            target=parser_worker,
-            name=f"mineru-parser-{worker_id}-port-{port}",
-            args=(
-                task_queue, result_queue, worker_id, port, str(spool_dir),
-                args.mineru_timeout, args.parse_retries,
-            ),
-        )
-        process.start()
-        processes.append(process)
-
-    # 子进程启动后才导入旧脚本，避免主进程提前加载 MinerU 相关依赖。
-    from algorithm.ai_tools import parallel_test_10000 as legacy
-    import httpx
-
-    legacy.DB3_PATH = args.db3_path
-    state = PipelineState()
-    parsed_queue: asyncio.Queue = asyncio.Queue(maxsize=args.parsed_queue_size)
-    checkpoint_lock = asyncio.Lock()
-    index_semaphore = asyncio.Semaphore(args.index_workers)
-    stop_event = threading.Event()
-    started = time.time()
-
-    timeout = httpx.Timeout(args.http_timeout)
-    limits = httpx.Limits(
-        max_connections=max(args.index_workers * 2, 10),
-        max_keepalive_connections=max(args.index_workers, 5),
-    )
-
-    try:
-        async with httpx.AsyncClient(
-            trust_env=False, timeout=timeout, limits=limits,
-        ) as http_client:
-            feeder = asyncio.create_task(feed_tasks(
-                task_queue, pdf_dir, processed_ids, args.limit,
-                parser_workers, state, stop_event,
-            ))
-            dispatcher = asyncio.create_task(dispatch_parser_results(
-                result_queue, parsed_queue, processes, args.index_workers,
-                state, stop_event,
-            ))
-            indexers = [
-                asyncio.create_task(index_worker(
-                    worker_id, parsed_queue, http_client, legacy,
-                    args.db3_path, checkpoint_file, failure_file,
-                    checkpoint_lock, index_semaphore, state,
-                ))
-                for worker_id in range(args.index_workers)
-            ]
-
-            await dispatcher
-            if stop_event.is_set() and not feeder.done():
-                feeder.cancel()
-            await asyncio.gather(feeder, return_exceptions=True)
-            await parsed_queue.join()
-            await asyncio.gather(*indexers)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        print("[STOP] 收到中断，停止提交新任务并终止解析进程。")
-        stop_event.set()
-    finally:
-        stop_event.set()
-        for process in processes:
-            process.join(timeout=5)
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-        task_queue.close()
-        result_queue.close()
-
-    elapsed = time.time() - started
-    summary = {
-        "version": "million_pdf_pipeline_v1",
-        "submitted": state.submitted,
-        "parsed": state.parsed,
-        "success": state.success,
-        "failed": state.failed,
-        "elapsed_seconds": round(elapsed, 2),
-        "throughput_per_hour": (
-            round(state.success / elapsed * 3600, 2) if elapsed > 0 else 0
-        ),
-        "counts": state.counts,
-        "recent_failures": state.failures[-1000:],
-        "unfinished_tasks": list(state.inflight.values())[:1000],
-    }
-    with stats_file.open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, ensure_ascii=False, indent=2)
-
-    print("=" * 72)
-    print(
-        f"完成: success={state.success}, failed={state.failed}, "
-        f"submitted={state.submitted}, elapsed={elapsed / 3600:.2f}h, "
-        f"throughput={summary['throughput_per_hour']} 篇/小时"
-    )
-    print(f"统计文件: {stats_file}")
-    print("=" * 72)
-    return summary
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="百万 PDF：多 MinerU 进程 + 异步 Embedding/ES 流水线",
-    )
-    parser.add_argument("--pdf-dir", default=str(DEFAULT_PDF_DIR))
-    parser.add_argument("--db3-path", default=str(DEFAULT_DB3_PATH))
-    parser.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR))
-    parser.add_argument("--limit", type=int, default=1_000_000)
-    parser.add_argument(
-        "--mineru-ports", default="8060",
-        help="MinerU 服务端口，逗号分隔，例如 8060,8061",
-    )
-    parser.add_argument(
-        "--workers-per-port", default="1",
-        help=(
-            "每个端口的解析 worker 数；可给统一值 4，或按端口给列表 2,3。"
-            "总解析进程数为这些数值之和"
-        ),
-    )
-    parser.add_argument("--index-workers", type=int, default=6)
-    parser.add_argument("--task-queue-size", type=int, default=32)
-    parser.add_argument("--parsed-queue-size", type=int, default=12)
-    parser.add_argument("--mineru-timeout", type=int, default=600)
-    parser.add_argument("--http-timeout", type=float, default=300.0)
-    parser.add_argument("--parse-retries", type=int, default=1)
-    return parser
-
-
-def main() -> None:
-    args = build_parser().parse_args()
-    if args.index_workers < 1:
-        raise ValueError("index-workers 必须 >= 1")
-    if args.task_queue_size < 1 or args.parsed_queue_size < 1:
-        raise ValueError("队列大小必须 >= 1")
-    asyncio.run(run_pipeline(args))
-
+        # 清理与收尾
+        logger.info("等待所有子进程退出...")
+        for p in processes:
+            p.join()
+            
+        duration = time.time() - start_time
+        logger.info(f"任务结束。耗时: {duration:.2f}秒。成功: {success_count}, 失败: {fail_count}")
+        
+        # 保存失败列表
+        if failed_files:
+            log_file = output_path / f"failed_files_{int(time.time())}.txt"
+            with open(log_file, "w", encoding="utf-8") as f:
+                for path, msg in failed_files:
+                    f.write(f"{path}\t{msg}\n")
+            logger.warning(f"失败文件列表已保存至: {log_file}")
 
 if __name__ == "__main__":
-    mp.freeze_support()
-    mp.set_start_method("spawn", force=True)
+    # 强制设置全局启动方法为 spawn，确保兼容性
+    mp.set_start_method('spawn', force=True)
+    
+    # 配置主进程日志
+    logger.configure(extra={"worker_id": "MAIN"})
+    logger.remove()
+    logger.add(sys.stderr, format=LOG_FORMAT, level="INFO")
+    
     main()
