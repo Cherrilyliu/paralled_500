@@ -105,6 +105,13 @@ ROLLOVER_STATS_EVERY_BULKS = 25
 ROLLOVER_STATS_EVERY_DOCS = 2_500
 ROLLOVER_NEAR_THRESHOLD_RATIO = 0.90
 
+
+class RolloverError(RuntimeError):
+    """ES 索引滚动异常。由 rollover_coordinator 在索引超限时抛出，
+    提示调用方需要切换新索引后重试。当前 rollover_coordinator 未实现，
+    此异常仅作预留，实际不会触发。
+    """
+
 # ── 日志配置 ──────────────────────────────────────────────────
 def setup_logging(state_dir: Path, level=logging.INFO):
     """初始化日志：同时输出到文件（pipeline.log）和 stdout。"""
