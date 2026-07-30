@@ -1072,17 +1072,24 @@ class StatusTracker:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def setup_worker_env(gpu_id: int, vram_size: int) -> None:
-    """配置 Worker 子进程的 GPU 环境变量。
+    """配置 Worker 子进程的 GPU 环境和 MinerU 模型路径。
     - CUDA_VISIBLE_DEVICES: 限制只能看到指定 GPU
     - MINERU_DEVICE_MODE:   始终使用 cuda:0（因为只暴露了一张卡）
+    - MINERU_MODEL_SOURCE:  模型源，先尝试本地，找不到再从 modelscope 拉
     - MINERU_VIRTUAL_VRAM_SIZE: 虚拟显存大小，避免 OOM
     - PYTORCH_CUDA_ALLOC_CONF: 启用可扩展内存段，减少碎片
+
+    MinerU 3.4 注意：
+      首次使用前需先在命令行执行 mineru-models-download -s modelscope -m pipeline
+      下载完成后 ~/.mineru.json 会自动记录模型路径，子进程读取该文件定位模型。
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    os.environ["MINERU_MODEL_SOURCE"] = "modelscope"
     os.environ["MINERU_DEVICE_MODE"] = "cuda:0"
     os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = str(vram_size)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    # MinerU 3.4 模型配置：优先本地已下载的模型，避免子进程网络不通导致下载失败
+    os.environ.setdefault("MINERU_MODEL_SOURCE", "modelscope")
 
 def extract_lngid(filename: str) -> str:
     """从 PDF 文件名提取 lngid（文档唯一标识）：
@@ -1183,20 +1190,26 @@ def analyze_pdf_locally(
 
     # ── 用闭包捕获 on_doc_ready 回调产出的 markdown ─────────
     # 3.4.4 的 doc_analyze_streaming 无返回值，通过回调异步返回每篇文档的处理结果
+    # 回调签名（来自源码 _finalize_processing_window_context）：
+    #   on_doc_ready(doc_index, model_list, middle_json, ocr_enable)
     result_markdown = [None]  # 列表包装，在闭包内可修改
 
-    def on_doc_ready(context: dict) -> None:
+    def on_doc_ready(doc_index: int, model_list: list, middle_json: dict, ocr_enable: bool) -> None:
         """当单篇文档所有页面处理完成后被 doc_analyze_streaming 回调。
-        context 中已包含完整的 middle_json，从中提取 pdf_info 生成 markdown。
+        参数由 _finalize_processing_window_context 传入：
+          doc_index:   文档在 pdf_bytes_list 中的索引
+          model_list:  MinerU 推理过程中使用的模型列表
+          middle_json: 已完成的中间 JSON（包含 pdf_info）
+          ocr_enable:  是否启用了 OCR
         """
-        pdf_info = context['middle_json']['pdf_info']
+        pdf_info = middle_json["pdf_info"]
         image_name = os.path.basename(image_dir)
         markdown_text = union_make(pdf_info, MakeMode.MM_MD, image_name)
         result_markdown[0] = markdown_text
 
     # ── MinerU 3.4.4 核心管线：版面分析 → 中间 JSON → 回调生成 Markdown ──
     # 旧版(2.7): doc_analyze() → result_to_middle_json() → union_make()
-    # 新版(3.4): doc_analyze_streaming() → on_doc_ready 回调 → union_make()
+    # 新版(3.4): doc_analyze_streaming() → on_doc_ready(doc_index, model_list, middle_json, ocr_enable) → union_make()
     doc_analyze_streaming(
         pdf_bytes_list=[pdf_bytes],
         image_writer_list=[image_writer],
